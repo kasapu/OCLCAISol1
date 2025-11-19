@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: oclc_postgres
+    environment:
+      POSTGRES_DB: oclc_wms
+      POSTGRES_USER: oclc_user
+      POSTGRES_PASSWORD: oclc_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oclc_user -d oclc_wms"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache and Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: oclc_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Application
+  api:
+    build: .
+    container_name: oclc_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://oclc_user:oclc_password@postgres:5432/oclc_wms
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src
+      - upload_data:/tmp/oclc_uploads
+      - result_data:/tmp/oclc_results
+      - model_data:/models
+    ports:
+      - "8000:8000"
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker for Batch Processing
+  worker:
+    build: .
+    container_name: oclc_worker
+    depends_on:
+      - postgres
+      - redis
+      - api
+    environment:
+      - DATABASE_URL=postgresql://oclc_user:oclc_password@postgres:5432/oclc_wms
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src
+      - upload_data:/tmp/oclc_uploads
+      - result_data:/tmp/oclc_results
+      - model_data:/models
+    command: celery -A src.pipeline.batch_processor worker --loglevel=info
+
+  # Flower - Celery Monitoring
+  flower:
+    build: .
+    container_name: oclc_flower
+    depends_on:
+      - redis
+      - worker
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    ports:
+      - "5555:5555"
+    command: celery -A src.pipeline.batch_processor flower --port=5555
+
+volumes:
+  postgres_data:
+  redis_data:
+  upload_data:
+  result_data:
+  model_data:
